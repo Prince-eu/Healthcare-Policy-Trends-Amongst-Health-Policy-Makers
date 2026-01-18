@@ -1,0 +1,690 @@
+---
+title:  "From Words to Wisdom "
+author: "Sharon Tsungai Prince"
+date: today
+format:
+  #html:
+    #self-contained: true
+    #code-fold: true
+    #code-tools: true
+  pdf:
+    titlepage: true
+    toc: true
+    toc-depth: 2
+    documentclass: article
+execute:
+  freeze: false
+  echo: true
+editor: visual
+---
+
+Loading Libraries
+
+```{r}
+library(readtext)
+library(pdftools)
+library(stringr)
+library(quanteda.textstats)
+library(quanteda)
+library(tm)
+library(tidyverse)
+library(tidytext)
+library(dplyr)
+library(ggplot2)
+library(wordcloud)
+library(reshape2)
+library(tidyr)
+library(haven)
+library(tibble)
+library(topicmodels)
+library(spacyr)
+
+```
+
+Set Working directory Please add your working directory to this line, make sure the Dataset folder is in that working directory.
+
+Get Working Directory
+
+```{r}
+getwd()
+```
+
+Importing Data
+
+```{r}
+global_path <- "Dataset/"
+```
+
+```{r}
+print(global_path)
+```
+
+```{r}
+# List all PDF files in the main folder and subfolders
+pdf_files <- list.files(path = global_path, pattern = "*.pdf", full.names = TRUE, recursive = TRUE)
+
+# Function to extract metadata from filenames
+extract_metadata <- function(file_path) {
+  # Extract the filename without the path
+  file_name <- basename(file_path)
+  
+  # Extract the relevant parts using regex based on your file structure
+  file_info <- str_match(file_name, "(Transcript|QandA)([A-Za-z]+)ODF(\\d{8})")
+  
+  # Extract relevant components (assuming the filename structure)
+  document_type <- file_info[2]  # Transcript
+  category <- file_info[3]       # RuralHealth, Hospital, Skilled Nursing Facility 
+  date_raw <- file_info[4]       # Date part (MMDDYYYY)
+  
+  # Convert the date from MMDDYYYY to a Date object in YYYY-MM-DD format
+  date <- as.Date(date_raw, format = "%m%d%Y")
+  
+  # Return metadata as a named list
+  return(list(document_type = document_type, category = category, date = date))
+}
+
+# Function to read and process each PDF file
+process_pdf <- function(pdf_file) {
+  # Extract text from the PDF
+  text <- pdf_text(pdf_file)
+  
+  # Extract metadata from the file name
+  metadata <- extract_metadata(pdf_file)
+  
+  # Create a tibble (data frame) with the text and metadata
+  tibble(
+    document_type = metadata$document_type,
+    category = metadata$category,
+    date = metadata$date,
+    content = paste(text, collapse = "\n")  # Combine all PDF pages into one string
+  )
+}
+
+# Process all PDFs and store them in a data frame
+CMS_Transcripts <- bind_rows(lapply(pdf_files, process_pdf))
+
+# View the final dataset
+CMS_Transcripts
+
+class(CMS_Transcripts)
+```
+
+Examining the structure of the Text object CMS_Transcripts
+
+```{r}
+str(CMS_Transcripts)
+```
+
+Generate A Corpus
+
+```{r}
+mycorpus <- corpus(CMS_Transcripts, text_field = "content")
+```
+
+Assigning a unique identifier to each of the text
+
+```{r}
+docvars(mycorpus, "Textno") <-
+sprintf("%02d", 1:ndoc(mycorpus))
+mycorpus
+```
+
+## Data Preprocessing
+
+Examining the statistics of my corpus
+
+```{r}
+mycorpus.stats <- summary(mycorpus)
+head(mycorpus.stats, n=50)
+```
+
+Preprocessing the Text by removing, punctuation, and numbers and special characters.
+
+```{r}
+token <-
+tokens(
+mycorpus,
+split_hyphens = TRUE,
+remove_numbers = TRUE,
+remove_punct = TRUE,
+remove_symbols = TRUE,
+remove_url = TRUE,
+include_docvars = TRUE
+)
+```
+
+```{r}
+token_cms <- tokens_select(
+token,
+c("[\\d-]", "[[:punct:]]", "^.{1,2}$"),
+selection = "remove",
+valuetype = "regex",
+verbose = TRUE
+)
+```
+
+Checking the summary of the tokenized
+
+```{r}
+summary(token_cms)
+```
+
+Tokenize the Dataset by N-Grams Tokenizing the data set by n-grams; by finding all phrases 2-4 words in length using the tokens_ngrams() function, and specifing the operator n = 2:4 in the argument.
+
+```{r}
+toks_ngram <- tokens_ngrams(token, n = 2:4)
+head(toks_ngram[[1]], 30)
+tail(toks_ngram[[1]], 30)
+```
+
+Creating a Document Feature Matrix using the dfm() function (the quanteda equivalent of a DTM), preprocessing the corpus in the process.
+
+```{r}
+custom_stopwords <- c( "open", "door", "forum", "hospital", "passcode", "record", "webinar", "januari", "centers", "medicare", "medicaid", "service", "jill", "darling", "cms", "odf", "welcome", "thank", "tuesday", "question", "answer", "februari")
+
+# Create a document-feature matrix (DFM) while converting to lowercase
+mydfm <- dfm(token_cms, tolower = TRUE)
+
+# Remove English stop words
+mydfm <- dfm_remove(mydfm, pattern = stopwords("english"))
+
+# Remove custom stop words
+mydfm <- dfm_remove(mydfm, pattern = custom_stopwords)
+
+# Apply word stemming
+mydfm <- dfm_wordstem(mydfm)
+
+# Print the resulting DFM
+print(mydfm)
+
+```
+
+Trim the DFM Trimming thr DFM by filtering words that appear less than 7.5% and more than 90%.
+
+```{r}
+mydfm.trim <-
+dfm_trim(
+mydfm,
+min_docfreq = 0.075,
+max_docfreq = 0.95,
+docfreq_type = "prop"
+)
+```
+
+Printing the first 5 observations and first 10 features
+
+```{r}
+head(dfm_sort(mydfm.trim, decreasing = TRUE, margin = "both"),
+n = 10,
+nf = 10)
+```
+
+```{r}
+dict <- dictionary(file = "policy_agendas_english.lcd")
+dict
+```
+
+## Deductive: Categorization Models
+
+#### Dictionary Use
+
+Applying the dictionary to filter the share of each category's transcripts on healthcare issues.
+
+```{r}
+# Step 1: Create the DFM without grouping or applying the dictionary
+mydfm.cms <- dfm(mydfm.trim)
+# Step 2: Apply the dictionary using dfm_lookup()
+mydfm.cms <- dfm_lookup(mydfm.cms, dictionary = dict)
+# Step 3: Group the DFM by "category" using dfm_group()
+mydfm.cms <- dfm_group(mydfm.cms, groups = docvars(mydfm.cms, "category"))
+
+
+```
+
+```{r}
+head(mydfm.cms)
+```
+
+```{r}
+topics.cms <- convert(mydfm.cms, "data.frame") %>%
+  tibble::rownames_to_column(var = "category") %>%  # Convert row names to column 'category'
+  select(category, macroeconomics, healthcare, labour, education) %>%  # Select relevant topic columns
+  tidyr::gather(key = "Topic", value = "Share", macroeconomics:education) %>%  # Gather topic columns
+  group_by(category) %>%  # Group by document category (i.e., 'category' column)
+  mutate(Share = Share / sum(Share)) %>%  # Normalize Share for each document category
+  mutate(Topic = as_factor(Topic))  # Convert Topic to a factor
+
+print(topics.cms)
+```
+
+Visualizing the results
+
+```{r}
+topics.cms %>%
+ggplot(aes(category, Share, colour = Topic, fill = Topic))+
+geom_bar(stat = "identity")+
+scale_color_brewer(palette = "Set1")+
+scale_fill_brewer(palette = "Pastel1")+
+ggtitle("Distribution of topics in the CMS Meetings corpus")+
+xlab("")+
+ylab("Topic share (%)")+
+theme(axis.text.x = element_blank(),
+axis.ticks.x = element_blank())
+```
+
+#### Sentiment Analysis
+
+```{r}
+colnames(mydfm.cms)
+
+```
+
+```{r}
+tidy_cms <- CMS_Transcripts %>%
+  group_by(category) %>%
+  mutate(linenumber = row_number(),  # Line numbers per category
+         section = cumsum(str_detect(as.character(content), 
+                                     regex("^(Section|Part|Meeting)", ignore_case = TRUE)))) %>% # Detect sections or parts
+  ungroup() %>%
+  unnest_tokens(word, content)  # Tokenize into individual words
+```
+
+```{r}
+nrc_joy <- get_sentiments("nrc") %>%
+  filter(sentiment == "joy")
+```
+
+```{r}
+joy_cms <- tidy_cms %>%
+  inner_join(nrc_joy, by = "word") %>%
+  count(category, word, sort = TRUE)  # Count the occurrence of joy-related words
+
+# View the joy-related word counts per category
+joy_cms
+```
+
+```{r}
+cms_sentiment <- tidy_cms %>%
+  inner_join(get_sentiments("bing")) %>%  # Use "nrc" for more nuanced sentiment
+  count(category, section, sentiment) %>%
+  spread(sentiment, n, fill = 0) %>%
+  mutate(sentiment_score = positive - negative)
+```
+
+```{r}
+# Plotting the Sentiment
+ggplot(cms_sentiment, aes(x = section, y = sentiment_score, fill = category)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ category, scales = "free_x", ncol = 2) +  # Add facets for each category
+  theme_minimal() +
+  labs(title = "Sentiment Analysis of CMS Transcripts",
+       x = "Section (grouped by 50 lines)", 
+       y = "Sentiment Score (Positive - Negative)") +
+  theme(strip.text = element_text(size = 12)) 
+```
+
+```{r}
+
+bing_word_counts_cms <- tidy_cms %>%
+  inner_join(get_sentiments("bing")) %>%  # Use the 'bing' sentiment lexicon
+  count(word, sentiment, sort = TRUE) %>%  # Count occurrences of words by sentiment
+  ungroup()
+
+# View the word counts with sentiments
+#View(bing_word_counts_cms)
+
+# Plot the top 10 positive and negative words contributing to sentiment
+bing_word_counts_cms %>%
+  group_by(sentiment) %>%
+  top_n(10) %>%  # Select top 10 words by sentiment
+  ungroup() %>%
+  mutate(word = reorder(word, n)) %>%  # Reorder words by their count
+  ggplot(aes(word, n, fill = sentiment)) +
+  geom_col(show.legend = FALSE) +  # Bar plot without legend
+  facet_wrap(~sentiment, scales = "free_y") +  # Separate panels for positive/negative sentiment
+  labs(y = "Contribution to sentiment", x = NULL) +  # Axis labels
+  coord_flip()  # Flip the coordinates for horizontal bars
+```
+
+```{r}
+# Create the word cloud after removing stop words
+tidy_cms %>%
+  inner_join(get_sentiments("bing")) %>%
+  count(word, sentiment) %>%
+  acast(word ~ sentiment, value.var = "n", fill = 0) %>%
+  comparison.cloud(colors = c("red", "blue"), max.words = 200, 
+                   random.order = FALSE, scale = c(1, 0.5))
+```
+
+## Inductive: Descriptive Analysis
+
+#### Key word Frequency (TF/TF\*IDF)
+
+```{r}
+# Calculate term frequencies directly using quanteda
+term_freq <- convert(mydfm.trim, to = "data.frame")
+
+# View the top terms and their frequencies
+head(term_freq)
+
+# Calculate Term Frequencies from the trimmed DFM
+term_freq <- textstat_frequency(mydfm.trim)
+
+# View the top terms
+head(term_freq)
+
+# Calculate TF-IDF on the trimmed DFM
+mydfm_tfidf <- dfm_tfidf(mydfm.trim)
+
+# Extract TF-IDF values into a frequency table
+term_tfidf <- textstat_frequency(mydfm_tfidf, force = T)
+
+# View top terms based on TF-IDF
+head(term_tfidf)
+
+
+```
+
+Term Frequency Visualization:
+
+```{r}
+# Visualize the top 10 terms by frequency
+ggplot(term_freq[1:10,], aes(x = reorder(feature, frequency), y = frequency)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Top Terms in CMS Transcripts by Frequency", x = "Term", y = "Frequency") +
+  theme_minimal()
+```
+
+TF-IDF Visualization:
+
+```{r}
+# Visualize the top 10 terms by TF-IDF
+ggplot(term_tfidf[1:10,], aes(x = reorder(feature, frequency), y = frequency)) +
+  geom_bar(stat = "identity", fill = "darkgreen") +
+  coord_flip() +
+  labs(title = "Top Terms in CMS Transcripts by TF-IDF", x = "Term", y = "TF-IDF Score") +
+  theme_minimal()
+```
+
+```{r}
+
+```
+
+Grouped Analysis for TF
+
+```{r}
+
+# Remove documents where category is NA
+mydfm_trimmed <- mydfm.trim[!is.na(docvars(mydfm.trim, "category")), ]
+
+# Group by category
+grouped_dfm <- dfm_group(mydfm_trimmed, groups = docvars(mydfm_trimmed, "category"))
+
+# Verify that grouping is correct by checking the document categories again
+head(docvars(grouped_dfm, "category"))
+
+# Calculate term frequencies for each group (category)
+grouped_term_freq <- textstat_frequency(grouped_dfm)
+
+# View the top terms for each category
+head(grouped_term_freq)
+```
+
+
+
+
+Visualizing Grouped TF
+
+```{r}
+# Plot term frequencies grouped by category
+ggplot(grouped_term_freq[1:10,], aes(x = reorder(feature, frequency), y = frequency, fill = group)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "Top Terms Grouped by Category", x = "Term", y = "Frequency") +
+  theme_minimal() +
+  facet_wrap(~group)
+```
+
+#### Key Phrase Frequency
+
+```{r}
+# Tokenize into bigrams
+bigrams_cms <- CMS_Transcripts %>%
+  unnest_tokens(bigram, content, token = "ngrams", n = 2)
+
+# Count most common bigrams
+bigrams_cms_count <- bigrams_cms %>%
+  count(bigram, sort = TRUE)
+
+# View top bigrams
+bigrams_cms_count %>% 
+  top_n(10) %>%
+  arrange(desc(n))
+```
+
+```{r}
+# Tokenize into trigrams
+trigrams_cms <- CMS_Transcripts %>%
+  unnest_tokens(trigram, content, token = "ngrams", n = 3)
+
+# Count most common trigrams
+trigrams_cms_count <- trigrams_cms %>%
+  count(trigram, sort = TRUE)
+
+# View top trigrams
+trigrams_cms_count %>% 
+  top_n(10) %>%
+  arrange(desc(n))
+```
+
+```{r}
+# Tokenize the content into individual words
+tidy_cms <- CMS_Transcripts %>%
+  unnest_tokens(word, content)
+
+# Remove stop words
+tidy_cms <- tidy_cms %>%
+  anti_join(stop_words)
+
+# Count term frequencies by category
+word_freq <- tidy_cms %>%
+  count(category, word, sort = TRUE)
+
+# Calculate TF-IDF
+word_tfidf <- word_freq %>%
+  bind_tf_idf(word, category, n) %>%
+  arrange(desc(tf_idf))
+
+# View the top TF-IDF terms
+word_tfidf %>%
+  top_n(10, tf_idf) %>%
+  select(word, tf_idf)
+```
+
+```{r}
+# Plot the top 10 bigrams
+bigrams_cms_count %>%
+  top_n(10) %>%
+  ggplot(aes(x = reorder(bigram, n), y = n)) +
+  geom_col(fill = "skyblue") +
+  coord_flip() +  # This makes the chart horizontal
+  labs(title = "Top 10 Bigrams in CMS Transcripts",
+       x = "Bigrams",
+       y = "Frequency") +
+  theme_minimal()
+```
+
+```{r}
+trigrams_cms_count %>%
+  top_n(10) %>%
+  ggplot(aes(x = reorder(trigram, n), y = n)) +
+  geom_col(fill = "lightgreen") +
+  coord_flip() +  # Flip the bars horizontally
+  labs(title = "Top 10 Trigrams in CMS Transcripts",
+       x = "Trigrams",
+       y = "Frequency") +
+  theme_minimal()
+```
+
+```{r}
+word_tfidf %>%
+  top_n(10, tf_idf) %>%
+  ggplot(aes(x = reorder(word, tf_idf), y = tf_idf)) +
+  geom_col(fill = "orange") +
+  coord_flip() +  # Horizontal bar chart
+  labs(title = "Top 10 TF-IDF Terms in CMS Transcripts",
+       x = "Terms",
+       y = "TF-IDF Score") +
+  theme_minimal()
+```
+
+## Deductive: Sub-Group Comparisons with Key Variables
+
+```{r}
+# Split the data by category (e.g., by sector or document type)
+subgroups <- split(topics.cms, topics.cms$category)
+
+# View the first subgroup
+if (length(subgroups) > 0) {
+  head(subgroups[[1]])
+}
+
+# Summary statistics (e.g., mean, standard deviation) for numeric variables
+summary_stats <- lapply(subgroups, function(df) {
+  summary(df[sapply(df, is.numeric)])
+})
+
+# Print the summary statistics for each subgroup
+print(summary_stats)
+
+# Create a data frame for topic proportions (without numeric columns)
+topics_df <- as.data.frame(topic_proportions) %>%
+  mutate(subgroup = rep(names(subgroups), length.out = nrow(topic_proportions))) %>%
+  pivot_longer(cols = starts_with("Topic"), names_to = "Topic", values_to = "Proportion")
+
+# Instead of working with numeric proportions, group by topic and count occurrences
+topic_counts <- topics_df %>%
+  group_by(subgroup, Topic) %>%
+  summarise(Count = n(), .groups = "drop")
+
+# View the aggregated topic counts
+print(topic_counts)
+
+
+
+```
+
+Visualizations
+
+```{r}
+# Convert data into long format for easier plotting
+long_data <- topics.cms %>%
+  gather(key = "Topic", value = "Proportion", -category)
+
+# Create a bar plot of topic proportions by category (sector)
+ggplot(long_data, aes(x = Topic, y = Proportion, fill = category)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Topic Distribution by Category", x = "Topic", y = "Proportion") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# Advanced Techniques
+
+## Inductive: Named Entity Recognition
+
+```{r}
+# # Initialize spaCy
+# spacy_initialize()
+# 
+# 
+# text <- sapply(mycorpus, function(doc) {
+#   paste(doc$content, collapse = " ")
+# })
+# 
+# # Parse the text and extract named entities
+# parsed_text <- spacy_parse(text)
+# 
+# # Perform Named Entity Recognition (NER)
+# named_entities <- entity_extract(parsed_text)
+# 
+# # View extracted entities
+# head(named_entities)
+# 
+# # Filter for specific types of entities
+# org_entities <- named_entities[named_entities$entity_type == "ORG", ]
+# location_entities <- named_entities[named_entities$entity_type == "GPE", ]
+# 
+# # View the results
+# head(org_entities)  # Organizations
+# head(location_entities)  # Locations
+
+```
+
+## Inductive: Unsupervised Machine Learning: Topic Modelling
+
+```{r}
+#Instead of performing topic modelling at a document level, we decided to do it at a category level 
+
+#Group documents by category in the DFM
+text_by_category <- dfm_group(mydfm.trim, groups = docvars(mydfm.trim, "category"))
+
+# Setting the number of topics to chose
+k <- 5
+
+#Fit LDA topic model
+lda_model_by_category <- LDA(text_by_category, k = k, control = list(seed = 1234))
+
+# Step 3: Inspect the terms associated with each topic
+top_terms <- terms(lda_model_by_category, 10)  # Top 10 terms per topic
+print(top_terms)
+
+# Step 4: View topic proportions for each category
+topic_proportions <- posterior(lda_model_by_category)$topics
+print(topic_proportions)
+```
+
+```{r}
+# Obtaining the Overall term probabilities per topic
+topic_terms <- posterior(lda_model_by_category)$terms
+head(topic_terms)
+
+
+```
+
+Visualizing the Topics
+
+```{r}
+# Convert topic_proportions to a data frame
+topic_df <- as.data.frame(topic_proportions)
+
+# Add the row names (Categories) as a new column
+topic_df$Category <- rownames(topic_proportions)
+
+# Reshape the data into long format
+topic_df_long <- topic_df %>%
+  tidyr::pivot_longer(
+    cols = -Category,       # Keep 'Category' column as it is, pivot all other columns
+    names_to = "Topic",     # Name of the new column for topics
+    values_to = "Proportion" # Name of the new column for topic proportions
+  )
+
+# Check the result
+head(topic_df_long)
+
+ggplot(topic_df_long, aes(x = Topic, y = Proportion, fill = Topic)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  facet_wrap(~ Category, scales = "free_y") +
+  theme_minimal() +
+  labs(
+    title = "Topic Proportions by Category",
+    x = "Topics",
+    y = "Proportion",
+    fill = "Topic"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(size = 12, face = "bold"),
+    legend.position = "bottom"
+  )
+```
